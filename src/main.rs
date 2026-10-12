@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
@@ -20,6 +20,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use nix_archive::nar;
 use nix_derivation::{NixHash, StoreDir, StorePath};
 use nix_narinfo::{Compression, NarInfo};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 use tracing::info;
 use url::Url;
@@ -39,17 +40,25 @@ struct Cli {
     #[arg(long = "allow-file")]
     allow_file: Option<PathBuf>,
 
-    /// SQLite state file (defaults to ./substituter-api.sqlite).
+    /// SQLite state file (defaults to $STATE_DIRECTORY, else ./).
     #[arg(long)]
     db: Option<PathBuf>,
+
+    /// Blob cache directory (defaults to $STATE_DIRECTORY/cache, else ./cache).
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+
+    /// Blob cache budget, in bytes; least-recently-used entries are evicted beyond it.
+    #[arg(long, default_value_t = 512 * 1024 * 1024)]
+    cache_max_size: u64,
 
     /// Store directory advertised in `.narinfo` files.
     #[arg(long, default_value = "/nix/store")]
     store_dir: String,
 
-    /// Nix binary-cache signing key; generated if missing.
-    #[arg(long, default_value = "substituter-api.key")]
-    sign_key: PathBuf,
+    /// Nix binary-cache signing key; generated if missing (defaults to $STATE_DIRECTORY, else ./).
+    #[arg(long)]
+    sign_key: Option<PathBuf>,
 
     /// Upstream timeout, in seconds.
     #[arg(long, default_value_t = 60)]
@@ -113,6 +122,18 @@ fn format_key(name: &str, bytes: &[u8]) -> String {
     )
 }
 
+/// systemd's `StateDirectory=` sets `$STATE_DIRECTORY`; fall back to the working dir.
+fn state_dir() -> PathBuf {
+    std::env::var_os("STATE_DIRECTORY")
+        .and_then(|paths| std::env::split_paths(&paths).next())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Kept under the state dir; a subdirectory so LRU eviction can't touch the key/db.
+fn cache_dir() -> PathBuf {
+    state_dir().join("cache")
+}
+
 fn write_secret(path: &PathBuf, contents: &str) -> Result<()> {
     #[cfg(unix)]
     {
@@ -136,6 +157,7 @@ struct App {
     whitelist: Arc<Whitelist>,
     client: reqwest::Client,
     cache: Arc<cache::Cache>,
+    blobs: Arc<cache::BlobCache>,
     store_dir: StoreDir,
     signer: Arc<Signer>,
 }
@@ -164,11 +186,23 @@ async fn main() -> Result<()> {
     }
     let whitelist = Arc::new(Whitelist::new(&rules, rules.is_empty())?);
 
+    let state_dir = state_dir();
     let db = args
         .db
         .clone()
-        .unwrap_or_else(|| "substituter-api.sqlite".into());
+        .unwrap_or_else(|| state_dir.join("substituter-api.sqlite"));
     let cache = Arc::new(cache::Cache::open(&db)?);
+    let sign_key = args
+        .sign_key
+        .clone()
+        .unwrap_or_else(|| state_dir.join("substituter-api.key"));
+
+    let cache_dir = args.cache_dir.clone().unwrap_or_else(cache_dir);
+    let blobs = Arc::new(cache::BlobCache::new(
+        cache_dir.clone(),
+        args.cache_max_size,
+    )?);
+    info!("blob cache: {}", cache_dir.display());
 
     let wl = whitelist.clone();
     let client = reqwest::Client::builder()
@@ -189,9 +223,10 @@ async fn main() -> Result<()> {
         whitelist,
         client,
         cache,
+        blobs,
         store_dir: StoreDir::new(args.store_dir.clone())
             .with_context(|| format!("invalid store dir {:?}", args.store_dir))?,
-        signer: Arc::new(Signer::load_or_generate(&args.sign_key)?),
+        signer: Arc::new(Signer::load_or_generate(&sign_key)?),
     };
 
     let app = Router::new()
@@ -239,16 +274,28 @@ async fn cache_info(State(state): State<App>) -> Response {
     )
 }
 
-async fn narinfo(State(state): State<App>, Path(file): Path<String>) -> Result<Response, ApiError> {
+async fn narinfo(
+    method: Method,
+    State(state): State<App>,
+    Path(file): Path<String>,
+) -> Result<Response, ApiError> {
     let stem = file
         .strip_suffix(".narinfo")
         .ok_or_else(|| ApiError::not_found("not found"))?;
     let (path, url) = lookup(&state, stem).await?;
+    if method == Method::HEAD {
+        resolve(&state, &url)?;
+        return Ok(bytes(StatusCode::OK, "text/x-nix-narinfo", Bytes::new()));
+    }
     let store_path = StorePath::from_basename(basename_of(&path).as_bytes())
         .map_err(|e| ApiError::internal(format!("registered path {path:?}: {e}")))?;
-    let content = fetch(&state, &url).await?;
+    let file = ensure_body(&state, &url).await?;
+    let nar_hash =
+        tokio::task::spawn_blocking(move || nar::hash_path(&file, nar::CaseHack::native()))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .map_err(|e| ApiError::internal(format!("nar hash: {e}")))?;
 
-    let nar_hash = nar::hash_regular(&content, false);
     let digest = NixHash::Sha256(nar_hash.sha256);
     let info = NarInfo::builder_in(
         state.store_dir.clone(),
@@ -282,20 +329,40 @@ async fn narinfo(State(state): State<App>, Path(file): Path<String>) -> Result<R
 }
 
 async fn nar_body(
+    method: Method,
     State(state): State<App>,
     Path(file): Path<String>,
 ) -> Result<Response, ApiError> {
     let stem = file.strip_suffix(".nar").unwrap_or(&file);
     let (_, url) = lookup(&state, stem).await?;
-    let content = fetch(&state, &url).await?;
-    let mut nar = Vec::new();
-    nar::encode_regular(&mut nar, &content, false)
-        .map_err(|e| ApiError::internal(format!("encoding NAR: {e}")))?;
-    Ok(bytes(
-        StatusCode::OK,
-        "application/x-nix-nar",
-        Bytes::from(nar),
-    ))
+    if method == Method::HEAD {
+        resolve(&state, &url)?;
+        return Ok(bytes(StatusCode::OK, "application/x-nix-nar", Bytes::new()));
+    }
+    let file = ensure_body(&state, &url).await?;
+    let size = tokio::fs::metadata(&file)
+        .await
+        .map_err(|e| ApiError::internal(format!("cache: {e}")))?
+        .len();
+    let (tx, rx) = tokio::io::duplex(64 * 1024);
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut src = std::fs::File::open(&file)?;
+        let mut bridge = tokio_util::io::SyncIoBridge::new(tx);
+        let io = |e: nar::Error| std::io::Error::other(e.to_string());
+        let mut encoder = nar::Encoder::new(&mut bridge).map_err(io)?;
+        let mut regular = encoder.start_regular(None, false, size).map_err(io)?;
+        std::io::copy(&mut src, &mut regular)?;
+        regular.finish().map_err(io)?;
+        encoder.finish().map_err(io)?;
+        Ok(())
+    });
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-nix-nar")
+        .body(axum::body::Body::from_stream(
+            tokio_util::io::ReaderStream::new(rx),
+        ))
+        .expect("building response"))
 }
 
 async fn lookup(state: &App, basename: &str) -> Result<(String, String), ApiError> {
@@ -318,9 +385,36 @@ fn resolve(state: &App, url: &str) -> Result<Url, ApiError> {
     Ok(parsed)
 }
 
-async fn fetch(state: &App, url: &str) -> Result<Bytes, ApiError> {
+/// Download `url` into the blob cache if not already there, and return its path.
+async fn ensure_body(state: &App, url: &str) -> Result<PathBuf, ApiError> {
     let parsed = resolve(state, url)?;
-    let resp = state
+    if let Some(path) = cached(state, url).await {
+        return Ok(path);
+    }
+
+    // Single-flight: only the first request for a URL hits the upstream.
+    let (key, lock) = state.blobs.lock(url);
+    let guard = lock.clone().lock_owned().await;
+    let result = match cached(state, url).await {
+        Some(path) => Ok(path),
+        None => fetch_into_cache(state, parsed, url).await,
+    };
+    drop(guard);
+    state.blobs.unlock(&key, &lock);
+    result
+}
+
+async fn cached(state: &App, url: &str) -> Option<PathBuf> {
+    if state.blobs.exists(url).await {
+        state.blobs.touch(url).await;
+        Some(state.blobs.path(url))
+    } else {
+        None
+    }
+}
+
+async fn fetch_into_cache(state: &App, parsed: Url, url: &str) -> Result<PathBuf, ApiError> {
+    let mut resp = state
         .client
         .get(parsed)
         .header(header::ACCEPT_ENCODING, "identity")
@@ -330,9 +424,38 @@ async fn fetch(state: &App, url: &str) -> Result<Bytes, ApiError> {
     if !resp.status().is_success() {
         return Err(ApiError::bad_gateway(format!("upstream {}", resp.status())));
     }
-    resp.bytes()
+
+    let tmp = state.blobs.temp(url);
+    if let Err(e) = download(&mut resp, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+
+    state
+        .blobs
+        .commit(url, &tmp)
         .await
-        .map_err(|e| ApiError::bad_gateway(format!("reading upstream: {e}")))
+        .map_err(|e| ApiError::internal(format!("cache: {e}")))?;
+    Ok(state.blobs.path(url))
+}
+
+async fn download(resp: &mut reqwest::Response, tmp: &std::path::Path) -> Result<(), ApiError> {
+    let mut file = tokio::fs::File::create(tmp)
+        .await
+        .map_err(|e| ApiError::internal(format!("cache: {e}")))?;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| ApiError::bad_gateway(format!("upstream: {e}")))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::internal(format!("cache: {e}")))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| ApiError::internal(format!("cache: {e}")))?;
+    Ok(())
 }
 
 fn parse_notify(text: &str, query: &HashMap<String, String>) -> Result<(String, String), ApiError> {

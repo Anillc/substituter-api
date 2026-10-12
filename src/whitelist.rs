@@ -24,7 +24,7 @@ struct Rule {
     path_prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Whitelist {
     rules: Vec<Rule>,
     allow_any: bool,

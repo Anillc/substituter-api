@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
-bytes = "1"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
 getrandom = { version = "0.3", features = ["std"] }
@@ -18,7 +17,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync"] }
+tokio-util = { version = "0.7", features = ["io", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
