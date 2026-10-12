@@ -30,5 +30,5 @@ A binary cache that proxies external URLs, so pure Nix evaluation can fetch reso
 
 ```bash
 $ nix run .
-$ nix build --option substituters http://127.0.0.1:8080 --option require-sigs false
+$ nix build --option substituters http://127.0.0.1:8080 --option trusted-public-keys "$(cat substituter-api.pub)"
 ```

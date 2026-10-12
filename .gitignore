@@ -1,3 +1,6 @@
 /.direnv
 /result
 /target
+/substituter-api.key
+/substituter-api.pub
+/substituter-api.sqlite*

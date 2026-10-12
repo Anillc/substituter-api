@@ -14,7 +14,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use base64::Engine;
 use clap::Parser;
+use ed25519_dalek::{Signer as _, SigningKey};
 use nix_archive::nar;
 use nix_derivation::{NixHash, StoreDir, StorePath};
 use nix_narinfo::{Compression, NarInfo};
@@ -45,9 +47,88 @@ struct Cli {
     #[arg(long, default_value = "/nix/store")]
     store_dir: String,
 
+    /// Nix binary-cache signing key; generated if missing.
+    #[arg(long, default_value = "substituter-api.key")]
+    sign_key: PathBuf,
+
     /// Upstream timeout, in seconds.
     #[arg(long, default_value_t = 60)]
     timeout: u64,
+}
+
+struct Signer {
+    name: String,
+    key: SigningKey,
+}
+
+impl Signer {
+    fn load_or_generate(path: &PathBuf) -> Result<Self> {
+        if path.exists() {
+            return Self::load(path);
+        }
+
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).context("generating randomness")?;
+        let key = SigningKey::from_bytes(&seed);
+        let name = "substituter-api-1".to_string();
+
+        write_secret(path, &format_key(&name, &key.to_keypair_bytes()))?;
+        let public = format_key(&name, &key.verifying_key().to_bytes());
+        let public_path = path.with_extension("pub");
+        std::fs::write(&public_path, &public)
+            .with_context(|| format!("writing {}", public_path.display()))?;
+
+        info!("generated signing key {}", path.display());
+        info!("public key ({}): {public}", public_path.display());
+
+        Ok(Signer { name, key })
+    }
+
+    fn load(path: &PathBuf) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let (name, b64) = text
+            .trim()
+            .split_once(':')
+            .context("expected `<name>:<base64>`")?;
+        let raw: [u8; 64] = base64::engine::general_purpose::STANDARD
+            .decode(b64)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("signing key must be 64 bytes"))?;
+        Ok(Signer {
+            name: name.to_string(),
+            key: SigningKey::from_keypair_bytes(&raw)?,
+        })
+    }
+
+    fn sign(&self, msg: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.key.sign(msg).to_bytes())
+    }
+}
+
+fn format_key(name: &str, bytes: &[u8]) -> String {
+    format!(
+        "{name}:{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+fn write_secret(path: &PathBuf, contents: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(contents.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -56,6 +137,7 @@ struct App {
     client: reqwest::Client,
     cache: Arc<cache::Cache>,
     store_dir: StoreDir,
+    signer: Arc<Signer>,
 }
 
 #[tokio::main]
@@ -109,6 +191,7 @@ async fn main() -> Result<()> {
         cache,
         store_dir: StoreDir::new(args.store_dir.clone())
             .with_context(|| format!("invalid store dir {:?}", args.store_dir))?,
+        signer: Arc::new(Signer::load_or_generate(&args.sign_key)?),
     };
 
     let app = Router::new()
@@ -180,10 +263,21 @@ async fn narinfo(State(state): State<App>, Path(file): Path<String>) -> Result<R
     .build()
     .map_err(|e| ApiError::internal(format!("narinfo: {e}")))?;
 
+    let mut body = info.to_canonical_bytes();
+    let fingerprint = info.fingerprint(&state.store_dir);
+    body.extend_from_slice(
+        format!(
+            "Sig: {}:{}\n",
+            state.signer.name,
+            state.signer.sign(fingerprint.as_bytes())
+        )
+        .as_bytes(),
+    );
+
     Ok(bytes(
         StatusCode::OK,
         "text/x-nix-narinfo",
-        Bytes::from(info.to_canonical_bytes()),
+        Bytes::from(body),
     ))
 }
 
