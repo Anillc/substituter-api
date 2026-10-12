@@ -5,11 +5,18 @@
     systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
     transposition.lib.adHoc = true;
 
-    perSystem = { pkgs, ... }: {
+    perSystem = { pkgs, lib, ... }: {
       packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "substituter-api";
         version = "0.1.0";
-        src = ./.;
+        src = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./src
+          ];
+        };
         cargoLock.lockFile = ./Cargo.lock;
       };
 
