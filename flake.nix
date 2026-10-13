@@ -5,7 +5,7 @@
     systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
     transposition.lib.adHoc = true;
 
-    perSystem = { pkgs, lib, ... }: {
+    perSystem = { self', pkgs, lib, ... }: {
       packages.default = pkgs.rustPlatform.buildRustPackage {
         pname = "substituter-api";
         version = "0.1.0";
@@ -18,6 +18,22 @@
           ];
         };
         cargoLock.lockFile = ./Cargo.lock;
+      };
+
+      packages.docker = pkgs.dockerTools.buildLayeredImage {
+        name = "substituter-api";
+        tag = "latest";
+        contents = [ self'.packages.default pkgs.cacert ];
+        config = {
+          Entrypoint = [ "${self'.packages.default}/bin/substituter-api" ];
+          Cmd = [ "--listen" "0.0.0.0:8080" ];
+          Env = [
+            "STATE_DIRECTORY=/data"
+            "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+          ];
+          ExposedPorts."8080/tcp" = { };
+          Volumes."/data" = { };
+        };
       };
 
       devShells.default = pkgs.mkShell {
