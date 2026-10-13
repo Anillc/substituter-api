@@ -52,6 +52,7 @@
         poke = pkgs.runCommand "poke-${builtins.hashString "sha256" "${server}:${url}"}" {
           outputHashMode = "recursive";
           outputHash = "sha256-d6xi4mKdjkX2JFicDIv5niSzpyI0m/Hnm8GGAIU04kY=";
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         } ''
           set -e
           ${pkgs.curl}/bin/curl -fsS ${server}/poke \
