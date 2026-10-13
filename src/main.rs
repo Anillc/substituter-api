@@ -245,7 +245,33 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
     info!("listening on http://{addr}");
-    axum::serve(listener, app).await.context("server error")
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")
+}
+
+/// Shut down gracefully on `SIGINT` or `SIGTERM` (the latter is what container
+/// runtimes and systemd send). Needed because as PID 1 an unhandled `SIGTERM`
+/// is ignored by the kernel.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c().await.expect("ctrl-c handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 async fn poke(State(state): State<App>, body: Bytes) -> Result<Response, ApiError> {
