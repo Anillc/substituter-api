@@ -21,7 +21,6 @@ A binary cache that proxies external URLs, so pure Nix evaluation can fetch reso
       packages.default = substituter-api.lib.${system}.fetch {
         inherit server;
         url = "https://www.google.com/robots.txt";
-        name = "google-robots";
       };
     };
   };

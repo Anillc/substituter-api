@@ -230,7 +230,7 @@ async fn main() -> Result<()> {
     };
 
     let app = Router::new()
-        .route("/notify", post(notify))
+        .route("/poke", post(poke))
         .route("/nix-cache-info", get(cache_info))
         .route("/nar/{*path}", get(nar_body))
         .route("/{file}", get(narinfo))
@@ -244,15 +244,26 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await.context("server error")
 }
 
-async fn notify(
+async fn poke(
     State(state): State<App>,
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let (path, url) = parse_notify(&String::from_utf8_lossy(&body), &query)?;
-    store_hash(&basename_of(&path))
+    let (path, url) = parse_poke(&String::from_utf8_lossy(&body), &query)?;
+    let basename = basename_of(&path);
+    store_hash(&basename)
+        .ok_or_else(|| ApiError::bad_request(format!("not a store path: {path:?}")))?;
+    let store_name = store_name(&basename)
         .ok_or_else(|| ApiError::bad_request(format!("not a store path: {path:?}")))?;
     resolve(&state, &url)?;
+    // The store name must commit to the url, so an anonymous registration can
+    // never point someone else's path at a different url.
+    if store_name != url_committed_name(&url) {
+        return Err(ApiError::forbidden(format!(
+            "store name must be `{}` (sha256(url)), got {store_name:?}",
+            url_committed_name(&url)
+        )));
+    }
 
     let cache = state.cache.clone();
     let (p, u) = (path.clone(), url.clone());
@@ -458,7 +469,7 @@ async fn download(resp: &mut reqwest::Response, tmp: &std::path::Path) -> Result
     Ok(())
 }
 
-fn parse_notify(text: &str, query: &HashMap<String, String>) -> Result<(String, String), ApiError> {
+fn parse_poke(text: &str, query: &HashMap<String, String>) -> Result<(String, String), ApiError> {
     let text = text.trim();
     if text.starts_with('{')
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
@@ -489,6 +500,20 @@ fn store_hash(basename: &str) -> Option<&str> {
 
 fn basename_of(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// The `<name>` of a `<hash>-<name>` store-path basename.
+fn store_name(basename: &str) -> Option<&str> {
+    let bytes = basename.as_bytes();
+    (bytes.len() > 33 && bytes[32] == b'-' && basename.is_char_boundary(33))
+        .then(|| &basename[33..])
+}
+
+/// The store name a client must use for `url`: the hex sha256 of the url.
+fn url_committed_name(url: &str) -> String {
+    let hex = nix_derivation::hash_bytes(nix_derivation::HashAlgorithm::Sha256, url.as_bytes())
+        .to_nix_base16_string();
+    hex.trim_start_matches("sha256:").to_string()
 }
 
 fn text(status: StatusCode, body: &str) -> Response {
@@ -559,9 +584,25 @@ mod tests {
     }
 
     #[test]
-    fn notify_body() {
+    fn poke_body() {
         let q = HashMap::new();
-        let (p, u) = parse_notify(r#"{"path":"/nix/store/x","url":"https://e.com/"}"#, &q).unwrap();
+        let (p, u) = parse_poke(r#"{"path":"/nix/store/x","url":"https://e.com/"}"#, &q).unwrap();
         assert_eq!((p.as_str(), u.as_str()), ("/nix/store/x", "https://e.com/"));
+    }
+
+    #[test]
+    fn committed_name() {
+        let name = url_committed_name("https://example.com/");
+        assert_eq!(name.len(), 64);
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(name, url_committed_name("https://example.com/"));
+        assert_ne!(name, url_committed_name("https://example.com/x"));
+    }
+
+    #[test]
+    fn store_name_split() {
+        let h = "0123456789abcdfghijklmnpqrsvwxyz";
+        assert_eq!(store_name(&format!("{h}-abc")), Some("abc"));
+        assert_eq!(store_name(h), None);
     }
 }
