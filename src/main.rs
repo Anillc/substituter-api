@@ -113,6 +113,10 @@ impl Signer {
     fn sign(&self, msg: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(self.key.sign(msg).to_bytes())
     }
+
+    fn public_key(&self) -> String {
+        format_key(&self.name, &self.key.verifying_key().to_bytes())
+    }
 }
 
 fn format_key(name: &str, bytes: &[u8]) -> String {
@@ -230,6 +234,7 @@ async fn main() -> Result<()> {
     };
 
     let app = Router::new()
+        .route("/", get(index))
         .route("/poke", post(poke))
         .route("/nix-cache-info", get(cache_info))
         .route("/nar/{*path}", get(nar_body))
@@ -283,6 +288,11 @@ async fn cache_info(State(state): State<App>) -> Response {
             state.store_dir
         ),
     )
+}
+
+/// `GET /` returns the public key, to paste into `trusted-public-keys`.
+async fn index(State(state): State<App>) -> Response {
+    text(StatusCode::OK, &format!("{}\n", state.signer.public_key()))
 }
 
 async fn narinfo(
