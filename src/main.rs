@@ -1,7 +1,6 @@
 mod cache;
 mod whitelist;
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -249,34 +248,36 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await.context("server error")
 }
 
-async fn poke(
-    State(state): State<App>,
-    Query(query): Query<HashMap<String, String>>,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    let (path, url) = parse_poke(&String::from_utf8_lossy(&body), &query)?;
-    let basename = basename_of(&path);
-    store_hash(&basename)
-        .ok_or_else(|| ApiError::bad_request(format!("not a store path: {path:?}")))?;
-    let store_name = store_name(&basename)
-        .ok_or_else(|| ApiError::bad_request(format!("not a store path: {path:?}")))?;
-    resolve(&state, &url)?;
-    // The store name must commit to the url, so an anonymous registration can
-    // never point someone else's path at a different url.
-    if store_name != url_committed_name(&url) {
-        return Err(ApiError::forbidden(format!(
-            "store name must be `{}` (sha256(url)), got {store_name:?}",
-            url_committed_name(&url)
-        )));
-    }
+async fn poke(State(state): State<App>, body: Bytes) -> Result<Response, ApiError> {
+    let entries = parse_poke(&body)?;
 
+    let mut records = Vec::with_capacity(entries.len());
+    for (path, url) in entries {
+        let basename = basename_of(&path);
+        if store_hash(&basename).is_none() {
+            return Err(ApiError::bad_request(format!("not a store path: {path:?}")));
+        }
+        let name = store_name(&basename)
+            .ok_or_else(|| ApiError::bad_request(format!("not a store path: {path:?}")))?;
+        resolve(&state, &url)?;
+        // The store name must commit to the url, so an anonymous registration can
+        // never point someone else's path at a different url.
+        if name != url_committed_name(&url) {
+            return Err(ApiError::forbidden(format!(
+                "store name must be `{}` (sha256(url)), got {name:?}",
+                url_committed_name(&url)
+            )));
+        }
+        records.push((path, url));
+    }
+    for (path, url) in &records {
+        info!("registered {path} -> {url}");
+    }
     let cache = state.cache.clone();
-    let (p, u) = (path.clone(), url.clone());
-    tokio::task::spawn_blocking(move || cache.record(&p, &u))
+    tokio::task::spawn_blocking(move || cache.record_many(&records))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    info!("registered {path} -> {url}");
     Ok(text(StatusCode::OK, "ok\n"))
 }
 
@@ -479,26 +480,29 @@ async fn download(resp: &mut reqwest::Response, tmp: &std::path::Path) -> Result
     Ok(())
 }
 
-fn parse_poke(text: &str, query: &HashMap<String, String>) -> Result<(String, String), ApiError> {
-    let text = text.trim();
-    if text.starts_with('{')
-        && let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
-        && let (Some(path), Some(url)) = (
-            v.get("path").and_then(|x| x.as_str()),
-            v.get("url").and_then(|x| x.as_str()),
-        )
-    {
-        return Ok((path.to_string(), url.to_string()));
+/// A JSON array of `{"path": <store path>, "url": <url>}` entries to register.
+fn parse_poke(body: &[u8]) -> Result<Vec<(String, String)>, ApiError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request(format!("expected a JSON array: {e}")))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| ApiError::bad_request("expected a JSON array"))?;
+    let mut entries = Vec::with_capacity(array.len());
+    for item in array {
+        let (Some(path), Some(url)) = (
+            item.get("path").and_then(|x| x.as_str()),
+            item.get("url").and_then(|x| x.as_str()),
+        ) else {
+            return Err(ApiError::bad_request(
+                "each entry must be {\"path\":...,\"url\":...}",
+            ));
+        };
+        entries.push((path.to_string(), url.to_string()));
     }
-    let mut words = text.split_whitespace();
-    if let (Some(a), Some(b)) = (words.next(), words.next()) {
-        let (path, url) = if a.starts_with('/') { (a, b) } else { (b, a) };
-        return Ok((path.to_string(), url.to_string()));
+    if entries.is_empty() {
+        return Err(ApiError::bad_request("no entries"));
     }
-    if let (Some(path), Some(url)) = (query.get("path"), query.get("url")) {
-        return Ok((path.clone(), url.clone()));
-    }
-    Err(ApiError::bad_request("expected {\"path\":...,\"url\":...}"))
+    Ok(entries)
 }
 
 fn store_hash(basename: &str) -> Option<&str> {
@@ -595,9 +599,13 @@ mod tests {
 
     #[test]
     fn poke_body() {
-        let q = HashMap::new();
-        let (p, u) = parse_poke(r#"{"path":"/nix/store/x","url":"https://e.com/"}"#, &q).unwrap();
-        assert_eq!((p.as_str(), u.as_str()), ("/nix/store/x", "https://e.com/"));
+        let body = br#"[{"path":"/nix/store/x","url":"https://e.com/"}]"#;
+        assert_eq!(
+            parse_poke(body).unwrap(),
+            vec![("/nix/store/x".to_string(), "https://e.com/".to_string())]
+        );
+        assert!(parse_poke(br#"{"path":"/nix/store/x","url":"https://e.com/"}"#).is_err());
+        assert!(parse_poke(br#"[]"#).is_err());
     }
 
     #[test]

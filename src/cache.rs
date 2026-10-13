@@ -195,13 +195,19 @@ impl Cache {
         })
     }
 
-    pub fn record(&self, path: &str, url: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("cache mutex");
-        conn.execute(
-            "INSERT INTO paths (path, url) VALUES (?1, ?2)
-             ON CONFLICT(path) DO UPDATE SET url = excluded.url",
-            params![path, url],
-        )?;
+    pub fn record_many(&self, entries: &[(String, String)]) -> Result<()> {
+        let mut conn = self.conn.lock().expect("cache mutex");
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO paths (path, url) VALUES (?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET url = excluded.url",
+            )?;
+            for (path, url) in entries {
+                stmt.execute(params![path, url])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -229,7 +235,9 @@ mod tests {
     fn record_and_lookup() {
         let dir = std::env::temp_dir().join(format!("substituter-api-test-{}", std::process::id()));
         let cache = Cache::open(&dir.join("cache.sqlite")).unwrap();
-        cache.record("/nix/store/abc-x", "https://e.com/").unwrap();
+        cache
+            .record_many(&[("/nix/store/abc-x".into(), "https://e.com/".into())])
+            .unwrap();
         assert_eq!(
             cache.lookup("/nix/store", "abc").unwrap().unwrap().1,
             "https://e.com/"

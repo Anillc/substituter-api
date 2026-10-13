@@ -40,28 +40,33 @@
         nativeBuildInputs = with pkgs; [ rustc cargo clippy rustfmt ];
       };
 
-      lib.fetch = { server, url }: let
-        # The server checks that the store-path name is sha256(url), so an
+      lib.fetchMany = { server, urls }: let
+        # The server checks that each store-path name is sha256(url), so an
         # anonymous registration can never point another path at a different url.
-        name = builtins.hashString "sha256" url;
-        data = pkgs.runCommand name { inherit server; } ''
+        hash = builtins.hashString "sha256";
+        data = map (url: pkgs.runCommand (hash url) { inherit server; } ''
           echo "substituter-api: expected to be substituted" >&2
           exit 1
-        '';
-        path = builtins.unsafeDiscardStringContext data.outPath;
-        poke = pkgs.runCommand "poke-${builtins.hashString "sha256" "${server}:${url}"}" {
+        '') urls;
+        body = map ({ fst, snd }: {
+          url = fst;
+          path = builtins.unsafeDiscardStringContext snd.outPath;
+        }) (lib.zipLists urls data);
+        poke = pkgs.runCommand "poke-${hash "${server}:${builtins.toJSON body}"}" {
           outputHashMode = "recursive";
           outputHash = "sha256-d6xi4mKdjkX2JFicDIv5niSzpyI0m/Hnm8GGAIU04kY=";
           SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         } ''
-          set -e
           ${pkgs.curl}/bin/curl -fsS --retry 5 --retry-all-errors ${server}/poke \
-            --data-binary ${pkgs.lib.escapeShellArg (builtins.toJSON { inherit path url; })}
+            --data-binary ${pkgs.lib.escapeShellArg (builtins.toJSON body)}
           touch $out
         '';
-      in pkgs.runCommand "fetch-${name}" { poke = builtins.readFile poke; } ''
-        cp ${data} $out
-      '';
+      in map (data: pkgs.runCommand "fetch-${data.name}" {
+        poke = builtins.readFile poke;
+      } "cp ${data} $out") data;
+
+      lib.fetch = { server, url }:
+        builtins.head (self'.lib.fetchMany { inherit server; urls = [ url ]; });
     };
   };
 }
