@@ -55,7 +55,7 @@
           SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         } ''
           set -e
-          ${pkgs.curl}/bin/curl -fsS ${server}/poke \
+          ${pkgs.curl}/bin/curl -fsS --retry 5 --retry-all-errors ${server}/poke \
             --data-binary ${pkgs.lib.escapeShellArg (builtins.toJSON { inherit path url; })}
           touch $out
         '';
