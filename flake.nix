@@ -58,7 +58,7 @@
           SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         } ''
           ${pkgs.curl}/bin/curl -fsS --retry 5 --retry-all-errors ${server}/poke \
-            --data-binary ${pkgs.lib.escapeShellArg (builtins.toJSON body)}
+            --data-binary @${pkgs.writeText "poke-body.json" (builtins.toJSON body)}
           touch $out
         '';
       in map (data: pkgs.runCommand "fetch-${data.name}" {
